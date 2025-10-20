@@ -222,41 +222,64 @@ def cache_query_result(question: str, sql: str, answer: str):
         print(f"Warning: Could not cache result: {e}")
 
 # --- Gemini SQL Generation ---
-GEN_SQL_PROMPT_TEMPLATE = """
-You are an expert SQL assistant for a MySQL database named {MYSQL_DATABASE}.
+GEN_SQL_PROMPT_TEMPLATE = """You are an expert SQL assistant for a MySQL database named {MYSQL_DATABASE}.
 
-RELEVANT DATABASE SCHEMA FOR THIS QUESTION:
+AVAILABLE TABLES AND SCHEMA:
 {schema_context}
 
 User Question: "{user_question}"
 
-CRITICAL INSTRUCTIONS:
-1. Generate ONLY a valid MySQL SELECT or SHOW query
-2. Use ONLY the tables and columns shown in the schema above
-3. Return ONLY the SQL query with NO explanations or markdown
-4. Do NOT invent column names - use only what's in the schema
+CRITICAL RULES:
+1. Use ONLY the EXACT table names listed above - do NOT modify or pluralize them
+2. Generate ONE complete, valid MySQL SELECT or SHOW query
+3. Return ONLY the SQL query - NO explanations, NO markdown, NO comments
+4. Keep queries SIMPLE - avoid complex nested queries
+5. For questions about "which table has most/maximum rows", generate a UNION query for ALL tables listed above
 
-SPECIAL CASES:
-- For "how many tables": SELECT COUNT(DISTINCT table_name) FROM information_schema.tables WHERE table_schema = '{MYSQL_DATABASE}'
-- For "show/list tables": SELECT table_name FROM information_schema.tables WHERE table_schema = '{MYSQL_DATABASE}'
-- For "describe table X": SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = '{MYSQL_DATABASE}' AND table_name = 'X'
+CORRECT TABLE NAME USAGE:
+- If you see "customer" in the schema, use "customer" NOT "customers"
+- If you see "employee" in the schema, use "employee" NOT "employees"
+- NEVER invent or guess table names - only use what's explicitly listed
+
+QUERY PATTERNS:
+- Count records: SELECT COUNT(*) FROM exact_table_name
+- Find largest table: Generate UNION ALL of all available tables, then ORDER BY count DESC LIMIT 1
+  Example: SELECT 'table1' AS table_name, COUNT(*) AS count FROM table1 UNION ALL SELECT 'table2', COUNT(*) FROM table2 ORDER BY count DESC LIMIT 1
 
 EXAMPLES:
-User: "how many customers?"
-SQL: SELECT COUNT(*) AS customer_count FROM customers
+Q: "how many customers?"
+Schema shows: customer
+A: SELECT COUNT(*) AS count FROM customer
 
-User: "list products"
-SQL: SELECT * FROM products LIMIT 50
+Q: "which table has most records?"
+Schema shows: customer, employee, invoice
+A: SELECT 'customer' AS table_name, COUNT(*) AS count FROM customer UNION ALL SELECT 'employee', COUNT(*) FROM employee UNION ALL SELECT 'invoice', COUNT(*) FROM invoice ORDER BY count DESC LIMIT 1
 
-User: "how many tables in database?"
-SQL: SELECT COUNT(DISTINCT table_name) AS table_count FROM information_schema.tables WHERE table_schema = '{MYSQL_DATABASE}'
+Q: "list all tables"
+A: SELECT table_name FROM information_schema.tables WHERE table_schema = '{MYSQL_DATABASE}'
 
-Return ONLY the SQL query:
+Return ONLY the SQL query (no explanations):
 """
+
+def get_all_table_names() -> List[str]:
+    """Get actual table names from database"""
+    try:
+        engine = get_sqlalchemy_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = :schema ORDER BY table_name"
+            ), {"schema": MYSQL_DATABASE})
+            return [row[0] for row in result]
+    except Exception as e:
+        print(f"Warning: Could not fetch table names: {e}")
+        return []
 
 def get_relevant_schema_context(user_question: str, top_k: int = 15) -> str:
     """Get relevant schema information based on user question using RAG"""
     try:
+        # First, get ALL actual table names from database
+        actual_tables = get_all_table_names()
+        
         # Embed the user question
         q_emb = embed_texts([user_question])[0]
         
@@ -268,7 +291,7 @@ def get_relevant_schema_context(user_question: str, top_k: int = 15) -> str:
         )
         
         if not results or not results.get('documents') or not results['documents'][0]:
-            return f"Database: {MYSQL_DATABASE}"
+            return f"Database: {MYSQL_DATABASE}\nAvailable tables: {', '.join(actual_tables)}"
 
         # Organize schema information by table
         tables_info = {}
@@ -277,26 +300,114 @@ def get_relevant_schema_context(user_question: str, top_k: int = 15) -> str:
             column = meta.get('column', 'unknown')
             data_type = meta.get('data_type', 'unknown')
             
-            if table not in tables_info:
-                tables_info[table] = []
-            tables_info[table].append(f"{column} ({data_type})")
+            # Only include if table actually exists
+            if table in actual_tables:
+                if table not in tables_info:
+                    tables_info[table] = []
+                tables_info[table].append(f"{column} ({data_type})")
         
-        # Format schema context
-        schema_lines = []
+        # Format schema context with actual table list
+        schema_lines = [f"EXACT TABLE NAMES (use these exactly): {', '.join(actual_tables)}", ""]
+        
         for table, columns in sorted(tables_info.items()):
             schema_lines.append(f"Table: {table}")
-            schema_lines.append(f"  Columns: {', '.join(columns)}")
+            schema_lines.append(f"  Columns: {', '.join(columns[:10])}")  # Limit columns to prevent overflow
+            schema_lines.append("")
 
-        return "\n".join(schema_lines) if schema_lines else f"Database: {MYSQL_DATABASE}"
+        return "\n".join(schema_lines) if len(schema_lines) > 2 else f"Database: {MYSQL_DATABASE}\nAvailable tables: {', '.join(actual_tables)}"
 
     except Exception as e:
         print(f"Warning: Could not get schema context: {e}")
-        return f"Database: {MYSQL_DATABASE}"
+        actual_tables = get_all_table_names()
+        return f"Database: {MYSQL_DATABASE}\nAvailable tables: {', '.join(actual_tables)}"
 
-def generate_sql_via_gemini(user_question: str) -> str:
-    """Generate SQL query using Gemini API with RAG schema context"""
+def clean_sql_response(raw_response: str) -> str:
+    """Clean and validate SQL response from LLM"""
+    msg = raw_response.strip()
+    
+    # Remove markdown code blocks
+    if "```sql" in msg.lower():
+        parts = msg.lower().split("```sql")
+        if len(parts) > 1:
+            msg = parts[1].split("```")[0].strip()
+    elif "```" in msg:
+        parts = msg.split("```")
+        if len(parts) > 1:
+            msg = parts[1].split("```")[0].strip()
+    
+    # Remove comments and clean lines
+    lines = []
+    for line in msg.splitlines():
+        line = line.strip()
+        # Skip empty lines and comments
+        if not line or line.startswith('--') or line.startswith('#'):
+            continue
+        # Remove inline comments
+        if '--' in line:
+            line = line.split('--')[0].strip()
+        if line:
+            lines.append(line)
+    
+    # Join lines into single query
+    sql_query = " ".join(lines).strip()
+    
+    # Remove trailing semicolon
+    sql_query = sql_query.rstrip(';').strip()
+    
+    return sql_query
+
+def validate_sql_query(sql: str) -> tuple[bool, str]:
+    """Validate SQL query structure and safety"""
+    if not sql:
+        return False, "Empty SQL query"
+    
+    sql_lower = sql.lower().strip()
+    
+    # Must start with SELECT or SHOW
+    if not (sql_lower.startswith("select") or sql_lower.startswith("show")):
+        return False, "Query must start with SELECT or SHOW"
+    
+    # Check for dangerous keywords
+    dangerous = ["drop", "delete", "insert", "update", "truncate", "alter", "create", "grant", "revoke"]
+    sql_words = sql_lower.split()
+    for keyword in dangerous:
+        if keyword in sql_words:
+            return False, f"Query contains forbidden keyword: {keyword}"
+    
+    # Basic structure validation for SELECT queries
+    if sql_lower.startswith("select"):
+        # Check for balanced parentheses
+        if sql.count('(') != sql.count(')'):
+            return False, "Unbalanced parentheses in query"
+        
+        # For non-information_schema queries, should have FROM clause
+        if "information_schema" not in sql_lower:
+            if "from" not in sql_lower and "dual" not in sql_lower:
+                return False, "SELECT query missing FROM clause"
+    
+    return True, "Valid"
+
+def generate_sql_via_gemini(user_question: str, max_retries: int = 2) -> str:
+    """Generate SQL query using Gemini API with validation and retry logic"""
+    
+    # Special handling for "maximum rows" type questions
+    question_lower = user_question.lower()
+    if any(phrase in question_lower for phrase in ['maximum row', 'most row', 'largest table', 'biggest table', 'which table has max']):
+        print("[INFO] Detected 'largest table' query - using optimized approach")
+        try:
+            # Get all actual table names
+            tables = get_all_table_names()
+            if tables:
+                # Build UNION query with actual table names
+                union_parts = [f"SELECT '{table}' AS table_name, COUNT(*) AS row_count FROM {table}" for table in tables]
+                sql_query = " UNION ALL ".join(union_parts) + " ORDER BY row_count DESC LIMIT 1"
+                print(f"[DEBUG] Generated optimized SQL for largest table query")
+                return sql_query
+        except Exception as e:
+            print(f"[WARNING] Could not generate optimized query: {e}, falling back to LLM")
+    
     # Get relevant schema information using RAG
-    schema_context = get_relevant_schema_context(user_question, top_k=20)
+    schema_context = get_relevant_schema_context(user_question, top_k=25)
     
     prompt = GEN_SQL_PROMPT_TEMPLATE.format(
         user_question=user_question,
@@ -304,89 +415,68 @@ def generate_sql_via_gemini(user_question: str) -> str:
         MYSQL_DATABASE=MYSQL_DATABASE,
     )
     
-    try:
-        response = client.chat.completions.create(
-            model=GEMINI_MODEL,
-            messages=[
-                {"role": "system", "content": "You are an expert MySQL database assistant. Generate only valid, complete SQL queries using ONLY the provided schema."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,  # Set to 0 for more deterministic results
-            max_tokens=512,
-        )
-        
-        msg = response.choices[0].message.content.strip()
-        
-        # Check for clarification request
-        if msg.upper().startswith("CLARIFY"):
-            return msg
-        
-        # Remove markdown code blocks
-        if "```sql" in msg.lower():
-            parts = msg.lower().split("```sql")
-            if len(parts) > 1:
-                msg = parts[1].split("```")[0].strip()
-        elif "```" in msg:
-            parts = msg.split("```")
-            if len(parts) > 1:
-                msg = parts[1].split("```")[0].strip()
-        
-        # Clean up the query
-        lines = [line.strip() for line in msg.splitlines() if line.strip() and not line.strip().startswith('#')]
-        
-        # Find the actual SQL query
-        sql_query = None
-        for i, line in enumerate(lines):
-            lower = line.lower()
-            if lower.startswith(("select", "with", "show")):
-                # Join all lines from this point to construct complete query
-                sql_query = " ".join(lines[i:])
-                break
-        
-        if not sql_query:
-            # If no SELECT/SHOW found, try to use the entire cleaned message
-            sql_query = " ".join(lines).strip()
-
-        if not sql_query:
-            raise ValueError("Model did not return a usable SQL query.")
-        
-        # Remove any trailing semicolons for now (we'll add them back if needed)
-        sql_query = sql_query.rstrip(';').strip()
-        
-        # Validate the query has basic structure
-        sql_lower = sql_query.lower()
-        if sql_lower.startswith("select"):
-            # Check if it has FROM clause (unless it's a system query or just a count)
-            if "from" not in sql_lower:
-                raise ValueError(f"Generated incomplete SQL query (missing FROM clause): {sql_query}")
-        
-        print(f"[DEBUG] Schema context used:\n{schema_context[:200]}...")
-        return sql_query
-        
-    except Exception as e:
-        print(f"Error generating SQL: {e}")
-        raise
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=GEMINI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert MySQL assistant. Use ONLY the exact table names provided in the schema. Generate ONLY valid, complete, SIMPLE SQL queries. Return ONLY the SQL with no explanations."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=1000,  # Increased for longer UNION queries
+            )
+            
+            raw_response = response.choices[0].message.content.strip()
+            
+            # Check for clarification request
+            if raw_response.upper().startswith("CLARIFY"):
+                return raw_response
+            
+            # Clean the response
+            sql_query = clean_sql_response(raw_response)
+            
+            if not sql_query:
+                if attempt < max_retries - 1:
+                    print(f"[Attempt {attempt + 1}] Empty query, retrying...")
+                    continue
+                raise ValueError("Model returned empty SQL query")
+            
+            # Validate the query
+            is_valid, error_msg = validate_sql_query(sql_query)
+            
+            if not is_valid:
+                if attempt < max_retries - 1:
+                    print(f"[Attempt {attempt + 1}] Invalid query: {error_msg}, retrying...")
+                    # Add error context to next attempt
+                    prompt += f"\n\nPREVIOUS ERROR: {error_msg}\nGenerate a simpler, valid query using ONLY the exact table names from the schema."
+                    continue
+                raise ValueError(f"Generated invalid SQL: {error_msg}")
+            
+            print(f"[DEBUG] Generated valid SQL: {sql_query[:100]}...")
+            return sql_query
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"[Attempt {attempt + 1}] Error: {e}, retrying...")
+                time.sleep(1)
+                continue
+            print(f"Error generating SQL after {max_retries} attempts: {e}")
+            raise
 
 def execute_sql_and_fetch(sql: str, limit: int = 100) -> pd.DataFrame:
     """Execute SQL query and return results as DataFrame"""
-    lowered = sql.strip().lower()
-    
-    # Allow ONLY SELECT and SHOW queries for safety
-    if not (lowered.startswith("select") or lowered.startswith("show")):
-        raise ValueError("Only SELECT and SHOW queries are allowed for safety")
-    
-    # Prevent malicious queries - check for dangerous keywords
-    dangerous_keywords = ["drop", "delete", "insert", "update", "truncate", "alter", "create", "grant", "revoke"]
-    sql_words = lowered.split()
-    for keyword in dangerous_keywords:
-        if keyword in sql_words:
-            raise ValueError(f"Query contains forbidden keyword: {keyword}")
+    # Final safety check
+    is_valid, error_msg = validate_sql_query(sql)
+    if not is_valid:
+        raise ValueError(f"Cannot execute invalid SQL: {error_msg}")
     
     engine = get_sqlalchemy_engine()
     safe_sql = sql.rstrip(';')
     
     # Add LIMIT if not present and it's a SELECT query (not information_schema)
-    if lowered.startswith("select") and "limit" not in lowered and "information_schema" not in lowered:
+    sql_lower = safe_sql.lower()
+    if sql_lower.startswith("select") and "limit" not in sql_lower and "information_schema" not in sql_lower:
         safe_sql = f"{safe_sql} LIMIT {limit}"
     
     try:
@@ -395,6 +485,7 @@ def execute_sql_and_fetch(sql: str, limit: int = 100) -> pd.DataFrame:
         return df
     except Exception as e:
         print(f"SQL execution error: {e}")
+        print(f"Query was: {safe_sql}")
         raise
 
 def result_to_nl_answer(df: pd.DataFrame, user_question: str) -> str:
@@ -438,6 +529,7 @@ def ask(user_question: str, cache_threshold: float = 0.85) -> Dict:
     
     print("[CACHE MISS] Generating new SQL query...")
     
+    sql = None
     try:
         sql = generate_sql_via_gemini(user_question)
         
@@ -468,7 +560,7 @@ def ask(user_question: str, cache_threshold: float = 0.85) -> Dict:
         return {
             "source": "error",
             "error": str(e),
-            "sql": sql if 'sql' in locals() else "No SQL generated"
+            "sql": sql if sql else "No SQL generated"
         }
 
 def get_database_summary():
