@@ -10,6 +10,7 @@ from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 from sqlalchemy import create_engine, text
 from typing import Optional, Dict, List, Tuple
+from datetime import datetime
 
 # --- Load config ---
 load_dotenv()
@@ -20,9 +21,13 @@ MYSQL_USER = os.getenv("MYSQL_USER")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+CSV_EXPORT_DIR = os.getenv("CSV_EXPORT_DIR", "./query_results")
 
 if not GEMINI_API_KEY:
     raise RuntimeError("Please set GEMINI_API_KEY in your .env file")
+
+# Create CSV export directory
+os.makedirs(CSV_EXPORT_DIR, exist_ok=True)
 
 # --- Configure OpenAI (Gemini endpoint) ---
 client = OpenAI(
@@ -81,10 +86,7 @@ def initialize_chroma():
     global chroma_client, schema_coll, cache_coll
     
     try:
-        # Create persistent directory if it doesn't exist
         os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
-        
-        # Try modern ChromaDB initialization (v0.4.0+)
         chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
         print(f"ChromaDB initialized at: {CHROMA_PERSIST_DIR}")
         
@@ -93,7 +95,6 @@ def initialize_chroma():
         print("Falling back to ephemeral client (data will not persist)")
         chroma_client = chromadb.Client()
     
-    # Get or create collections
     try:
         schema_coll = chroma_client.get_or_create_collection(
             name="schema",
@@ -108,7 +109,6 @@ def initialize_chroma():
         print(f"Error initializing collections: {e}")
         raise
 
-# Initialize ChromaDB
 initialize_chroma()
 
 def build_document_text_from_row(row: Dict) -> str:
@@ -117,11 +117,7 @@ def build_document_text_from_row(row: Dict) -> str:
         f"TABLE: {row.get('TABLE NAME', '')}",
         f"COLUMN: {row.get('COLUMN NAME', '')}",
         f"TYPE: {row.get('DATA TYPE', '')}",
-        f"MAX_LENGTH: {row.get('MAX LENGTH', '')}",
-        f"IS_NULLABLE: {row.get('IS NULLABLE', '')}",
-        f"COLUMN_KEY: {row.get('COLUMN KEY', '')}",
-        f"DEFAULT: {row.get('DEFAULT VALUE', '')}",
-        f"EXTRA: {row.get('EXTRA INFO', '')}",
+        f"KEY: {row.get('COLUMN KEY', '')}",
     ]
     return " | ".join(str(p) for p in parts if p)
 
@@ -146,6 +142,7 @@ def populate_schema_collection(overwrite: bool = False):
             "table": str(r.get("TABLE NAME", "")),
             "column": str(r.get("COLUMN NAME", "")),
             "data_type": str(r.get("DATA TYPE", "")),
+            "column_key": str(r.get("COLUMN KEY", "")),
         })
         ids.append(f"schema_row_{i}_{r.get('TABLE NAME')}_{r.get('COLUMN NAME')}")
     
@@ -156,13 +153,12 @@ def populate_schema_collection(overwrite: bool = False):
         try:
             chroma_client.delete_collection("schema")
         except Exception as e:
-            print(f"Note: Could not delete collection (may not exist): {e}")
+            print(f"Note: Could not delete collection: {e}")
         
         global schema_coll
         schema_coll = chroma_client.create_collection(name="schema")
     
     try:
-        # Use upsert to handle duplicates gracefully
         schema_coll.upsert(
             ids=ids,
             documents=texts,
@@ -177,7 +173,7 @@ def populate_schema_collection(overwrite: bool = False):
 def query_cache_find_similar(
     question: str, 
     top_k: int = 1, 
-    score_threshold: float = 0.80
+    score_threshold: float = 0.88
 ) -> Tuple[Optional[Dict], float]:
     """Search cache for similar questions"""
     try:
@@ -217,50 +213,10 @@ def cache_query_result(question: str, sql: str, answer: str):
             metadatas=[{"sql": sql, "answer": answer}],
             embeddings=[q_emb]
         )
-        print("Query result cached successfully")
     except Exception as e:
         print(f"Warning: Could not cache result: {e}")
 
-# --- Gemini SQL Generation ---
-GEN_SQL_PROMPT_TEMPLATE = """You are an expert SQL assistant for a MySQL database named {MYSQL_DATABASE}.
-
-AVAILABLE TABLES AND SCHEMA:
-{schema_context}
-
-User Question: "{user_question}"
-
-CRITICAL RULES:
-1. Use ONLY the EXACT table names listed above - do NOT modify or pluralize them
-2. Generate ONE complete, valid MySQL SELECT or SHOW query
-3. Return ONLY the SQL query - NO explanations, NO markdown, NO comments
-4. Keep queries SIMPLE - avoid complex nested queries
-5. For questions about "which table has most/maximum rows", generate a UNION query for ALL tables listed above
-
-CORRECT TABLE NAME USAGE:
-- If you see "customer" in the schema, use "customer" NOT "customers"
-- If you see "employee" in the schema, use "employee" NOT "employees"
-- NEVER invent or guess table names - only use what's explicitly listed
-
-QUERY PATTERNS:
-- Count records: SELECT COUNT(*) FROM exact_table_name
-- Find largest table: Generate UNION ALL of all available tables, then ORDER BY count DESC LIMIT 1
-  Example: SELECT 'table1' AS table_name, COUNT(*) AS count FROM table1 UNION ALL SELECT 'table2', COUNT(*) FROM table2 ORDER BY count DESC LIMIT 1
-
-EXAMPLES:
-Q: "how many customers?"
-Schema shows: customer
-A: SELECT COUNT(*) AS count FROM customer
-
-Q: "which table has most records?"
-Schema shows: customer, employee, invoice
-A: SELECT 'customer' AS table_name, COUNT(*) AS count FROM customer UNION ALL SELECT 'employee', COUNT(*) FROM employee UNION ALL SELECT 'invoice', COUNT(*) FROM invoice ORDER BY count DESC LIMIT 1
-
-Q: "list all tables"
-A: SELECT table_name FROM information_schema.tables WHERE table_schema = '{MYSQL_DATABASE}'
-
-Return ONLY the SQL query (no explanations):
-"""
-
+# --- Enhanced Schema Context ---
 def get_all_table_names() -> List[str]:
     """Get actual table names from database"""
     try:
@@ -274,16 +230,42 @@ def get_all_table_names() -> List[str]:
         print(f"Warning: Could not fetch table names: {e}")
         return []
 
-def get_relevant_schema_context(user_question: str, top_k: int = 15) -> str:
-    """Get relevant schema information based on user question using RAG"""
+def get_table_relationships() -> str:
+    """Get foreign key relationships"""
     try:
-        # First, get ALL actual table names from database
+        engine = get_sqlalchemy_engine()
+        with engine.connect() as conn:
+            fk_query = text("""
+                SELECT 
+                    TABLE_NAME,
+                    COLUMN_NAME,
+                    REFERENCED_TABLE_NAME,
+                    REFERENCED_COLUMN_NAME
+                FROM information_schema.KEY_COLUMN_USAGE
+                WHERE TABLE_SCHEMA = :schema
+                AND REFERENCED_TABLE_NAME IS NOT NULL
+            """)
+            df = pd.read_sql(fk_query, conn, params={"schema": MYSQL_DATABASE})
+            
+            if df.empty:
+                return ""
+            
+            relationships = []
+            for _, row in df.iterrows():
+                relationships.append(
+                    f"{row['TABLE_NAME']}.{row['COLUMN_NAME']} -> "
+                    f"{row['REFERENCED_TABLE_NAME']}.{row['REFERENCED_COLUMN_NAME']}"
+                )
+            return "Foreign Key Relationships:\n" + "\n".join(relationships)
+    except Exception as e:
+        return ""
+
+def get_relevant_schema_context(user_question: str, top_k: int = 30) -> str:
+    """Get comprehensive schema context with better organization"""
+    try:
         actual_tables = get_all_table_names()
-        
-        # Embed the user question
         q_emb = embed_texts([user_question])[0]
         
-        # Query schema collection for relevant schema info
         results = schema_coll.query(
             query_embeddings=[q_emb],
             n_results=top_k,
@@ -291,41 +273,81 @@ def get_relevant_schema_context(user_question: str, top_k: int = 15) -> str:
         )
         
         if not results or not results.get('documents') or not results['documents'][0]:
-            return f"Database: {MYSQL_DATABASE}\nAvailable tables: {', '.join(actual_tables)}"
+            return f"Database: {MYSQL_DATABASE}\nTables: {', '.join(actual_tables)}"
 
-        # Organize schema information by table
+        # Organize by table with primary keys highlighted
         tables_info = {}
         for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
             table = meta.get('table', 'unknown')
             column = meta.get('column', 'unknown')
             data_type = meta.get('data_type', 'unknown')
+            col_key = meta.get('column_key', '')
             
-            # Only include if table actually exists
             if table in actual_tables:
                 if table not in tables_info:
-                    tables_info[table] = []
-                tables_info[table].append(f"{column} ({data_type})")
+                    tables_info[table] = {'columns': [], 'pk': []}
+                
+                col_desc = f"{column} ({data_type})"
+                if col_key == 'PRI':
+                    tables_info[table]['pk'].append(column)
+                    col_desc += " [PRIMARY KEY]"
+                elif col_key == 'MUL':
+                    col_desc += " [FOREIGN KEY]"
+                
+                tables_info[table]['columns'].append(col_desc)
         
-        # Format schema context with actual table list
-        schema_lines = [f"EXACT TABLE NAMES (use these exactly): {', '.join(actual_tables)}", ""]
+        # Build context
+        context_parts = [
+            f"=== DATABASE: {MYSQL_DATABASE} ===",
+            f"Available Tables: {', '.join(actual_tables)}",
+            "",
+            "=== DETAILED SCHEMA ===",
+        ]
         
-        for table, columns in sorted(tables_info.items()):
-            schema_lines.append(f"Table: {table}")
-            schema_lines.append(f"  Columns: {', '.join(columns[:10])}")  # Limit columns to prevent overflow
-            schema_lines.append("")
-
-        return "\n".join(schema_lines) if len(schema_lines) > 2 else f"Database: {MYSQL_DATABASE}\nAvailable tables: {', '.join(actual_tables)}"
+        for table, info in sorted(tables_info.items()):
+            context_parts.append(f"\nTable: {table}")
+            if info['pk']:
+                context_parts.append(f"  Primary Key: {', '.join(info['pk'])}")
+            context_parts.append(f"  Columns: {', '.join(info['columns'][:15])}")
+        
+        # Add relationships
+        relationships = get_table_relationships()
+        if relationships:
+            context_parts.append(f"\n{relationships}")
+        
+        return "\n".join(context_parts)
 
     except Exception as e:
-        print(f"Warning: Could not get schema context: {e}")
+        print(f"Warning: Error in schema context: {e}")
         actual_tables = get_all_table_names()
-        return f"Database: {MYSQL_DATABASE}\nAvailable tables: {', '.join(actual_tables)}"
+        return f"Database: {MYSQL_DATABASE}\nTables: {', '.join(actual_tables)}"
+
+# --- SQL Generation ---
+GEN_SQL_PROMPT_TEMPLATE = """You are an expert MySQL database assistant for the {MYSQL_DATABASE} database.
+
+{schema_context}
+
+USER QUESTION: "{user_question}"
+
+INSTRUCTIONS:
+1. Analyze the question carefully and use the schema above
+2. Generate ONE valid MySQL query using ONLY the exact table/column names shown
+3. Return ONLY the SQL query - no explanations, no markdown
+4. Use proper JOINs when querying related tables
+5. Keep queries efficient and simple
+
+CRITICAL RULES:
+- Use exact table names (e.g., if schema shows "customer", use "customer" NOT "customers")
+- Never invent table or column names
+- For "most/maximum rows" questions: use UNION ALL pattern
+- For aggregations: use proper GROUP BY clauses
+
+Return only the SQL query:"""
 
 def clean_sql_response(raw_response: str) -> str:
-    """Clean and validate SQL response from LLM"""
+    """Clean SQL response from LLM"""
     msg = raw_response.strip()
     
-    # Remove markdown code blocks
     if "```sql" in msg.lower():
         parts = msg.lower().split("```sql")
         if len(parts) > 1:
@@ -335,79 +357,55 @@ def clean_sql_response(raw_response: str) -> str:
         if len(parts) > 1:
             msg = parts[1].split("```")[0].strip()
     
-    # Remove comments and clean lines
     lines = []
     for line in msg.splitlines():
         line = line.strip()
-        # Skip empty lines and comments
         if not line or line.startswith('--') or line.startswith('#'):
             continue
-        # Remove inline comments
         if '--' in line:
             line = line.split('--')[0].strip()
         if line:
             lines.append(line)
     
-    # Join lines into single query
-    sql_query = " ".join(lines).strip()
-    
-    # Remove trailing semicolon
-    sql_query = sql_query.rstrip(';').strip()
-    
+    sql_query = " ".join(lines).strip().rstrip(';').strip()
     return sql_query
 
 def validate_sql_query(sql: str) -> tuple[bool, str]:
-    """Validate SQL query structure and safety"""
+    """Validate SQL query"""
     if not sql:
-        return False, "Empty SQL query"
+        return False, "Empty query"
     
     sql_lower = sql.lower().strip()
     
-    # Must start with SELECT or SHOW
     if not (sql_lower.startswith("select") or sql_lower.startswith("show")):
-        return False, "Query must start with SELECT or SHOW"
+        return False, "Must start with SELECT or SHOW"
     
-    # Check for dangerous keywords
-    dangerous = ["drop", "delete", "insert", "update", "truncate", "alter", "create", "grant", "revoke"]
-    sql_words = sql_lower.split()
-    for keyword in dangerous:
-        if keyword in sql_words:
-            return False, f"Query contains forbidden keyword: {keyword}"
+    dangerous = ["drop", "delete", "insert", "update", "truncate", "alter", "create"]
+    if any(kw in sql_lower.split() for kw in dangerous):
+        return False, "Contains forbidden keyword"
     
-    # Basic structure validation for SELECT queries
     if sql_lower.startswith("select"):
-        # Check for balanced parentheses
         if sql.count('(') != sql.count(')'):
-            return False, "Unbalanced parentheses in query"
-        
-        # For non-information_schema queries, should have FROM clause
-        if "information_schema" not in sql_lower:
-            if "from" not in sql_lower and "dual" not in sql_lower:
-                return False, "SELECT query missing FROM clause"
+            return False, "Unbalanced parentheses"
     
     return True, "Valid"
 
 def generate_sql_via_gemini(user_question: str, max_retries: int = 2) -> str:
-    """Generate SQL query using Gemini API with validation and retry logic"""
+    """Generate SQL with enhanced schema understanding"""
     
-    # Special handling for "maximum rows" type questions
+    # Special handling for largest table queries
     question_lower = user_question.lower()
-    if any(phrase in question_lower for phrase in ['maximum row', 'most row', 'largest table', 'biggest table', 'which table has max']):
-        print("[INFO] Detected 'largest table' query - using optimized approach")
+    if any(p in question_lower for p in ['maximum row', 'most row', 'largest table', 'biggest table']):
+        print("[INFO] Detected 'largest table' query")
         try:
-            # Get all actual table names
             tables = get_all_table_names()
             if tables:
-                # Build UNION query with actual table names
-                union_parts = [f"SELECT '{table}' AS table_name, COUNT(*) AS row_count FROM {table}" for table in tables]
-                sql_query = " UNION ALL ".join(union_parts) + " ORDER BY row_count DESC LIMIT 1"
-                print(f"[DEBUG] Generated optimized SQL for largest table query")
-                return sql_query
+                union_parts = [f"SELECT '{t}' AS table_name, COUNT(*) AS row_count FROM {t}" for t in tables]
+                return " UNION ALL ".join(union_parts) + " ORDER BY row_count DESC LIMIT 1"
         except Exception as e:
-            print(f"[WARNING] Could not generate optimized query: {e}, falling back to LLM")
+            print(f"[WARNING] Fallback to LLM: {e}")
     
-    # Get relevant schema information using RAG
-    schema_context = get_relevant_schema_context(user_question, top_k=25)
+    schema_context = get_relevant_schema_context(user_question, top_k=30)
     
     prompt = GEN_SQL_PROMPT_TEMPLATE.format(
         user_question=user_question,
@@ -420,106 +418,157 @@ def generate_sql_via_gemini(user_question: str, max_retries: int = 2) -> str:
             response = client.chat.completions.create(
                 model=GEMINI_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are an expert MySQL assistant. Use ONLY the exact table names provided in the schema. Generate ONLY valid, complete, SIMPLE SQL queries. Return ONLY the SQL with no explanations."},
+                    {"role": "system", "content": "You are a MySQL expert. Use ONLY exact table/column names from the schema. Return ONLY valid SQL queries."},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.1,
-                max_tokens=1000,  # Increased for longer UNION queries
+                temperature=0.0,
+                max_tokens=1200,
             )
             
             raw_response = response.choices[0].message.content.strip()
-            
-            # Check for clarification request
-            if raw_response.upper().startswith("CLARIFY"):
-                return raw_response
-            
-            # Clean the response
             sql_query = clean_sql_response(raw_response)
             
             if not sql_query:
                 if attempt < max_retries - 1:
-                    print(f"[Attempt {attempt + 1}] Empty query, retrying...")
                     continue
-                raise ValueError("Model returned empty SQL query")
+                raise ValueError("Empty SQL query")
             
-            # Validate the query
             is_valid, error_msg = validate_sql_query(sql_query)
-            
             if not is_valid:
                 if attempt < max_retries - 1:
-                    print(f"[Attempt {attempt + 1}] Invalid query: {error_msg}, retrying...")
-                    # Add error context to next attempt
-                    prompt += f"\n\nPREVIOUS ERROR: {error_msg}\nGenerate a simpler, valid query using ONLY the exact table names from the schema."
+                    prompt += f"\n\nERROR: {error_msg}. Fix and return only the corrected SQL."
                     continue
-                raise ValueError(f"Generated invalid SQL: {error_msg}")
+                raise ValueError(f"Invalid SQL: {error_msg}")
             
-            print(f"[DEBUG] Generated valid SQL: {sql_query[:100]}...")
+            print(f"[SQL Generated] {sql_query[:80]}...")
             return sql_query
             
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"[Attempt {attempt + 1}] Error: {e}, retrying...")
                 time.sleep(1)
                 continue
-            print(f"Error generating SQL after {max_retries} attempts: {e}")
             raise
 
 def execute_sql_and_fetch(sql: str, limit: int = 100) -> pd.DataFrame:
-    """Execute SQL query and return results as DataFrame"""
-    # Final safety check
+    """Execute SQL and return full results"""
     is_valid, error_msg = validate_sql_query(sql)
     if not is_valid:
-        raise ValueError(f"Cannot execute invalid SQL: {error_msg}")
+        raise ValueError(f"Invalid SQL: {error_msg}")
     
     engine = get_sqlalchemy_engine()
     safe_sql = sql.rstrip(';')
     
-    # Add LIMIT if not present and it's a SELECT query (not information_schema)
+    # Don't add LIMIT for counting queries or information_schema
     sql_lower = safe_sql.lower()
-    if sql_lower.startswith("select") and "limit" not in sql_lower and "information_schema" not in sql_lower:
-        safe_sql = f"{safe_sql} LIMIT {limit}"
+    needs_limit = (
+        sql_lower.startswith("select") and 
+        "limit" not in sql_lower and 
+        "information_schema" not in sql_lower and
+        "count(*)" not in sql_lower
+    )
     
     try:
         with engine.connect() as conn:
+            # Execute without LIMIT to get full results
             df = pd.read_sql(text(safe_sql), conn)
         return df
     except Exception as e:
-        print(f"SQL execution error: {e}")
-        print(f"Query was: {safe_sql}")
+        print(f"SQL error: {e}")
         raise
 
-def result_to_nl_answer(df: pd.DataFrame, user_question: str) -> str:
-    """Convert DataFrame results to natural language answer"""
+# --- Natural Language Answer Generation ---
+def generate_nl_answer(user_question: str, sql: str, df: pd.DataFrame, csv_file: Optional[str] = None) -> str:
+    """Generate natural language answer using Gemini"""
+    
     if df is None or df.shape[0] == 0:
         return "No results found for your query."
     
-    n = df.shape[0]
-    preview_rows = min(5, n)
-    preview = df.head(preview_rows).to_dict(orient="records")
+    # Prepare data summary
+    row_count = df.shape[0]
+    col_count = df.shape[1]
     
-    lines = []
-    for row in preview:
-        line = " | ".join(f"{k}: {v}" for k, v in row.items())
-        lines.append(line)
+    # Get sample data (first 10 rows)
+    sample_data = df.head(10).to_dict(orient='records')
     
-    result = f"Found {n} row{'s' if n != 1 else ''}.\n\n"
-    if n <= preview_rows:
-        result += "Results:\n" + "\n".join(lines)
-    else:
-        result += f"Showing first {preview_rows} results:\n" + "\n".join(lines)
-        result += f"\n\n(+ {n - preview_rows} more rows)"
-    
-    return result
+    # Create prompt for NL generation
+    prompt = f"""Based on the following database query results, provide a clear, natural language answer to the user's question.
 
-def ask(user_question: str, cache_threshold: float = 0.85) -> Dict:
-    """Main function to answer user questions"""
+USER QUESTION: "{user_question}"
+
+SQL QUERY EXECUTED: {sql}
+
+RESULTS SUMMARY:
+- Total rows: {row_count}
+- Columns: {', '.join(df.columns.tolist())}
+
+SAMPLE DATA (first 10 rows):
+{json.dumps(sample_data, indent=2, default=str)}
+
+INSTRUCTIONS:
+1. Provide a direct answer to the user's question
+2. Use natural, conversational language
+3. Highlight key findings and insights
+4. Include specific numbers and values from the data
+5. If there are many rows, summarize the key patterns
+6. Keep it concise but informative
+
+Your natural language answer:"""
+
+    try:
+        response = client.chat.completions.create(
+            model=GEMINI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a helpful data analyst. Provide clear, natural language answers based on database query results."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=500,
+        )
+        
+        nl_answer = response.choices[0].message.content.strip()
+        
+        # Add CSV file info if applicable
+        if csv_file:
+            nl_answer += f"\n\n📄 Complete results ({row_count} rows) saved to: {csv_file}"
+        
+        return nl_answer
+        
+    except Exception as e:
+        print(f"Warning: Could not generate NL answer: {e}")
+        # Fallback to basic summary
+        return f"Found {row_count} rows with {col_count} columns. " + \
+               f"Sample: {df.head(3).to_string(index=False)}"
+
+# --- CSV Export ---
+def save_to_csv(df: pd.DataFrame, question: str) -> str:
+    """Save DataFrame to CSV file"""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Clean filename
+        clean_q = "".join(c if c.isalnum() or c in (' ', '_') else '_' for c in question)
+        clean_q = clean_q[:50].strip().replace(' ', '_')
+        
+        filename = f"query_{timestamp}_{clean_q}.csv"
+        filepath = os.path.join(CSV_EXPORT_DIR, filename)
+        
+        df.to_csv(filepath, index=False, encoding='utf-8')
+        print(f"[CSV Export] Saved {len(df)} rows to: {filepath}")
+        return filepath
+        
+    except Exception as e:
+        print(f"Warning: Could not save CSV: {e}")
+        return None
+
+# --- Main Query Function ---
+def ask(user_question: str, cache_threshold: float = 0.88, csv_threshold: int = 50) -> Dict:
+    """Main function with NL answers and CSV export"""
     if not user_question.strip():
-        return {"source": "error", "error": "Empty question provided"}
+        return {"source": "error", "error": "Empty question"}
     
-    # Check cache first
-    cached, score = query_cache_find_similar(user_question, top_k=1, score_threshold=cache_threshold)
+    # Check cache
+    cached, score = query_cache_find_similar(user_question, score_threshold=cache_threshold)
     if cached:
-        print(f"[CACHE HIT] Similarity score: {score:.2f}")
+        print(f"[CACHE HIT] Score: {score:.2f}")
         return {
             "source": "cache",
             "question": cached["question"],
@@ -527,33 +576,34 @@ def ask(user_question: str, cache_threshold: float = 0.85) -> Dict:
             "answer": cached["answer"]
         }
     
-    print("[CACHE MISS] Generating new SQL query...")
+    print("[CACHE MISS] Generating new query...")
     
     sql = None
     try:
         sql = generate_sql_via_gemini(user_question)
+        print(f"[Executing SQL] {sql}")
         
-        # Check if clarification is needed
-        if sql.startswith("CLARIFY:"):
-            return {
-                "source": "clarification",
-                "message": sql.replace("CLARIFY:", "").strip()
-            }
+        # Execute query - get ALL results
+        df = execute_sql_and_fetch(sql)
+        row_count = df.shape[0]
         
-        print(f"Generated SQL: {sql}")
+        # Save to CSV if results are large
+        csv_file = None
+        if row_count > csv_threshold:
+            csv_file = save_to_csv(df, user_question)
         
-        # Execute query
-        df = execute_sql_and_fetch(sql, limit=200)
-        answer = result_to_nl_answer(df, user_question)
+        # Generate natural language answer
+        nl_answer = generate_nl_answer(user_question, sql, df, csv_file)
         
         # Cache the result
-        cache_query_result(user_question, sql, answer)
+        cache_query_result(user_question, sql, nl_answer)
         
         return {
             "source": "live",
             "sql": sql,
-            "answer": answer,
-            "rows": df.shape[0]
+            "answer": nl_answer,
+            "rows": row_count,
+            "csv_file": csv_file
         }
         
     except Exception as e:
@@ -564,69 +614,65 @@ def ask(user_question: str, cache_threshold: float = 0.85) -> Dict:
         }
 
 def get_database_summary():
-    """Get a summary of available tables in the database"""
+    """Get database summary"""
     try:
         engine = get_sqlalchemy_engine()
         with engine.connect() as conn:
-            # Get all tables
             tables_query = text("""
                 SELECT table_name, table_rows 
                 FROM information_schema.tables 
                 WHERE table_schema = :schema
-                ORDER BY table_name
+                ORDER BY table_rows DESC
             """)
             df = pd.read_sql(tables_query, conn, params={"schema": MYSQL_DATABASE})
             return df
     except Exception as e:
-        print(f"Warning: Could not fetch database summary: {e}")
+        print(f"Warning: Could not fetch summary: {e}")
         return None
 
 def main():
-    """Main interactive loop"""
+    """Main loop"""
     global cache_coll
-    print("=" * 60)
-    print("RAG-based SQL Query System")
-    print("=" * 60)
+    print("=" * 70)
+    print("🚀 Enhanced RAG-based SQL Query System with NL Answers")
+    print("=" * 70)
     
     try:
-        print("\nInitializing schema collection...")
+        print("\n[1/3] Initializing schema collection...")
         populate_schema_collection(overwrite=False)
         
-        # Clear old cache to prevent issues with cached bad queries
-        print("Checking query cache...")
+        print("\n[2/3] Checking cache...")
         try:
             cache_count = cache_coll.count()
             if cache_count > 0:
                 print(f"Found {cache_count} cached queries.")
-                clear_cache = input("Clear old cache? (y/n, default=n): ").strip().lower()
-                if clear_cache == 'y':
+                clear = input("Clear cache? (y/n, default=n): ").strip().lower()
+                if clear == 'y':
                     chroma_client.delete_collection("query_cache")
-                    cache_coll = chroma_client.create_collection(
-                        name="query_cache",
-                        metadata={"description": "Cached query results"}
-                    )
-                    print("✓ Cache cleared successfully")
+                    cache_coll = chroma_client.create_collection(name="query_cache")
+                    print("✓ Cache cleared")
         except Exception as e:
-            print(f"Note: Could not check cache: {e}")
+            print(f"Note: {e}")
         
-        # Show database summary
-        print("\n" + "=" * 60)
-        print("DATABASE SUMMARY")
-        print("=" * 60)
+        print("\n[3/3] Loading database summary...")
         summary = get_database_summary()
         if summary is not None and not summary.empty:
-            print(f"\nDatabase: {MYSQL_DATABASE}")
-            print(f"Total tables: {len(summary)}\n")
-            print(summary.to_string(index=False))
-        print("=" * 60)
+            print(f"\n{'='*70}")
+            print(f"DATABASE: {MYSQL_DATABASE}")
+            print(f"Total Tables: {len(summary)}")
+            print(f"{'='*70}")
+            print(summary.to_string(index=False, max_rows=10))
+            if len(summary) > 10:
+                print(f"... and {len(summary) - 10} more tables")
+            print(f"{'='*70}")
         
-        print("\n✓ System ready!")
-        print("\nYou can now ask questions about the database.")
-        print("Examples:")
-        print("  - How many tables in this database?")
-        print("  - Show me all tables")
-        print("  - How many customers?")
-        print("  - List all products")
+        print("\n✅ System Ready!")
+        print(f"\n📁 Large results (>50 rows) will be saved to: {CSV_EXPORT_DIR}")
+        print("\n💡 Examples:")
+        print("  • How many customers do we have?")
+        print("  • Which table has the most records?")
+        print("  • Show me top 10 products by price")
+        print("  • List all employees with their departments")
         print("\nType 'exit' or 'quit' to stop.\n")
         
         while True:
@@ -637,38 +683,35 @@ def main():
                     continue
                 
                 if q.lower() in ("exit", "quit", "q"):
-                    print("\nGoodbye!")
+                    print("\n👋 Goodbye!")
                     break
                 
+                print()  # Add spacing
                 resp = ask(q)
                 
                 if resp.get("source") == "error":
-                    print(f"\n❌ Error: {resp.get('error')}")
+                    print(f"❌ Error: {resp.get('error')}")
                     if resp.get("sql"):
-                        print(f"SQL attempted: {resp.get('sql')}")
-                
-                elif resp.get("source") == "clarification":
-                    print(f"\n❓ {resp.get('message')}")
+                        print(f"\n📝 SQL attempted:\n{resp.get('sql')}")
                 
                 elif resp.get("source") == "cache":
-                    print(f"\n💾 Answer (from cache):\n{resp.get('answer')}")
-                    print(f"\n📝 SQL used:\n{resp.get('sql')}")
+                    print(f"💾 Answer (cached):\n{resp.get('answer')}")
+                    print(f"\n📝 SQL:\n{resp.get('sql')}")
                 
                 else:
-                    print(f"\n✓ Answer:\n{resp.get('answer')}")
-                    print(f"\n📝 SQL executed:\n{resp.get('sql')}")
+                    print(f"✅ Answer:\n{resp.get('answer')}")
+                    print(f"\n📝 SQL ({resp.get('rows')} rows):\n{resp.get('sql')}")
                 
             except KeyboardInterrupt:
-                print("\n\nInterrupted. Type 'exit' to quit.")
+                print("\n\n⚠️  Interrupted. Type 'exit' to quit.")
                 continue
             except Exception as e:
-                print(f"\n❌ Unexpected error: {e}")
+                print(f"\n❌ Error: {e}")
                 import traceback
                 traceback.print_exc()
-                continue
                 
     except Exception as e:
-        print(f"\n❌ Fatal error during initialization: {e}")
+        print(f"\n❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
         raise
